@@ -1,11 +1,15 @@
 import socket
 import os
 import datetime
-import sys
 import select
+import struct
+import time
 
 HOST = '0.0.0.0'
 PORT = 9090
+CHUNK_SIZE = 32768
+WINDOW_SIZE = 64
+TIMEOUT = 0.5
 
 def get_local_ip():
     try:
@@ -17,153 +21,147 @@ def get_local_ip():
     except Exception:
         return "127.0.0.1"
 
-def setup_keepalive(sock):
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    if sys.platform == 'win32':
-        sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30000, 10000))
-    elif hasattr(socket, 'TCP_KEEPIDLE'):
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
-
-def read_line(conn):
-    line = b''
-    while True:
-        r, _, _ = select.select([conn], [], [], 0.5)
-        if not r:
-            continue
-            
-        char = conn.recv(1)
-        if not char:
-            return None
-        line += char
-        if char == b'\n':
-            return line.decode('utf-8', errors='ignore').strip()
-
-def handle_echo(conn, args):
-    msg = " ".join(args) + "\n"
-    conn.sendall(msg.encode())
-
-def handle_time(conn):
-    time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n"
-    conn.sendall(time_str.encode())
-
-def handle_download(conn, args):
-    if len(args) < 2:
-        conn.sendall(b"ERROR invalid arguments\n")
-        return
-    filename, offset_str = args[0], args[1]
-    
+def send_file_udp(sock, addr, filename, offset):
     try:
-        offset = int(offset_str)
-        if not os.path.exists(filename) or not os.path.isfile(filename):
-            conn.sendall(b"ERROR file not found\n")
-            return
-            
         filesize = os.path.getsize(filename)
-        conn.sendall(f"OK {filesize}\n".encode())
+        sock.sendto(f"OK {filesize}".encode(), addr)
         
-        if offset >= filesize:
-            return 
-
-        with open(filename, 'rb') as f:
-            f.seek(offset)
-            while True:
-                chunk = f.read(4096)
-                if not chunk:
-                    break
-                conn.sendall(chunk)
-    except Exception as e:
-        pass 
-
-def handle_upload(conn, args):
-    if len(args) < 2:
-        conn.sendall(b"ERROR invalid arguments\n")
-        return
-    filename, filesize_str = args[0], args[1]
-    
-    try:
-        filesize = int(filesize_str)
-        offset = os.path.getsize(filename) if os.path.exists(filename) else 0
+        f = open(filename, 'rb')
+        f.seek(offset)
         
-        conn.sendall(f"OK {offset}\n".encode())
-        
-        if offset >= filesize:
-            return 
-            
-        remaining = filesize - offset
-        with open(filename, 'ab') as f:
-            while remaining > 0:
-                r, _, _ = select.select([conn], [], [], 0.5)
-                if not r:
-                    continue
-                    
-                chunk = conn.recv(min(4096, remaining))
-                if not chunk:
-                    break 
-                f.write(chunk)
-                remaining -= len(chunk)
-    except Exception as e:
-        pass
+        base = 0
+        next_seq = 0
+        total_chunks = (filesize - offset + CHUNK_SIZE - 1) // CHUNK_SIZE
+        window_buffer = {}
 
-def process_client(conn, addr):
-    print(f"Client connected: {addr}")
-    conn.settimeout(None) 
-    try:
-        while True:
-            data = read_line(conn)
-            if data is None:
-                break 
-            
-            parts = data.split()
-            if not parts:
-                continue
-            
-            cmd = parts[0].upper()
-            if cmd == 'ECHO':
-                handle_echo(conn, parts[1:])
-            elif cmd == 'TIME':
-                handle_time(conn)
-            elif cmd in ('CLOSE', 'EXIT', 'QUIT'):
-                break
-            elif cmd == 'DOWNLOAD':
-                handle_download(conn, parts[1:])
-            elif cmd == 'UPLOAD':
-                handle_upload(conn, parts[1:])
+        while base < total_chunks:
+            while next_seq < base + WINDOW_SIZE and next_seq < total_chunks:
+                if next_seq not in window_buffer:
+                    f.seek(offset + next_seq * CHUNK_SIZE)
+                    data = f.read(CHUNK_SIZE)
+                    packet = struct.pack('I', next_seq) + data
+                    window_buffer[next_seq] = packet
+                
+                sock.sendto(window_buffer[next_seq], addr)
+                next_seq += 1
+
+            ready, _, _ = select.select([sock], [], [], TIMEOUT)
+            if ready:
+                try:
+                    data, _ = sock.recvfrom(1024)
+                    ack_seq = struct.unpack('I', data)[0]
+                    if ack_seq >= base:
+                        for i in range(base, ack_seq + 1):
+                            if i in window_buffer:
+                                del window_buffer[i]
+                        base = ack_seq + 1
+                except:
+                    pass
             else:
-                conn.sendall(b"UNKNOWN COMMAND\n")
-    except ConnectionResetError:
-        pass
-    except KeyboardInterrupt:
-        raise 
+                next_seq = base
+
+        f.close()
+    except Exception:
+        sock.sendto(b"ERROR during transfer", addr)
+
+def recv_file_udp(sock, addr, filename, filesize):
+    try:
+        sock.sendto(b"OK", addr)
+        f = open(filename, 'wb')
+        expected_seq = 0
+        total_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE
+        
+        sock.settimeout(5.0)
+        
+        while expected_seq < total_chunks:
+            try:
+                packet, src = sock.recvfrom(CHUNK_SIZE + 16)
+                if src != addr:
+                    continue
+                
+                seq = struct.unpack('I', packet[:4])[0]
+                data = packet[4:]
+                
+                if seq == expected_seq:
+                    f.write(data)
+                    ack_packet = struct.pack('I', seq)
+                    sock.sendto(ack_packet, addr)
+                    expected_seq += 1
+                elif seq < expected_seq:
+                    ack_packet = struct.pack('I', seq)
+                    sock.sendto(ack_packet, addr)
+                else:
+                    ack_packet = struct.pack('I', expected_seq - 1)
+                    sock.sendto(ack_packet, addr)
+                    
+            except socket.timeout:
+                break
+                
+        f.close()
+        sock.settimeout(None)
     except Exception:
         pass
-    finally:
-        print(f"Client disconnected: {addr}")
-        conn.close()
 
 def start_server():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    setup_keepalive(s)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind((HOST, PORT))
-    s.listen(1)
-    s.settimeout(0.5) 
     
-    local_ip = get_local_ip()
-    print(f"Server is listening on 0.0.0.0:{PORT}")
-    print(f"Your Local IP for client to connect: {local_ip}")
+    print(f"UDP Server listening on {HOST}:{PORT}")
+    print(f"Local IP: {get_local_ip()}")
     
     while True:
         try:
-            conn, addr = s.accept()
-            process_client(conn, addr)
-        except socket.timeout:
-            continue
+            r, _, _ = select.select([s], [], [], 1.0)
+            if not r:
+                continue
+                
+            data, addr = s.recvfrom(4096)
+            msg = data.decode('utf-8', errors='ignore').strip()
+            parts = msg.split()
+            
+            if not parts:
+                continue
+                
+            cmd = parts[0].upper()
+            
+            if cmd == 'ECHO':
+                response = " ".join(parts[1:])
+                s.sendto(response.encode(), addr)
+                
+            elif cmd == 'TIME':
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                s.sendto(now.encode(), addr)
+                
+            elif cmd == 'DOWNLOAD':
+                if len(parts) < 2:
+                    s.sendto(b"ERROR usage: DOWNLOAD <filename>", addr)
+                    continue
+                filename = parts[1]
+                offset = int(parts[2]) if len(parts) > 2 else 0
+                
+                if os.path.exists(filename):
+                    send_file_udp(s, addr, filename, offset)
+                else:
+                    s.sendto(b"ERROR file not found", addr)
+                    
+            elif cmd == 'UPLOAD':
+                if len(parts) < 3:
+                    s.sendto(b"ERROR usage: UPLOAD <filename> <size>", addr)
+                    continue
+                filename = parts[1]
+                filesize = int(parts[2])
+                recv_file_udp(s, addr, filename, filesize)
+                
+            elif cmd in ('EXIT', 'QUIT', 'CLOSE'):
+                s.sendto(b"GOODBYE", addr)
+                
+            else:
+                s.sendto(b"UNKNOWN COMMAND", addr)
+                
         except KeyboardInterrupt:
-            print("\nServer shutting down manually.")
             break
         except Exception as e:
-            print(f"Server error: {e}")
+            print(f"Error: {e}")
             
     s.close()
 
