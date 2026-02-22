@@ -6,9 +6,9 @@ import time
 PACKET_SIZE = 32768
 HEADER_FMT = '!IB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-WINDOW_SIZE = 64     
-ACK_FREQUENCY = 16       
-MAX_RETRIES = 50        
+WINDOW_SIZE = 64
+ACK_FREQUENCY = 16
+MAX_RETRIES = 70
 
 TYPE_DATA = 0
 TYPE_ACK = 1
@@ -118,7 +118,7 @@ class RUDPConnection:
                     if seq == expected_seq:
                         received_chunks[seq] = payload
                         expected_seq += 1
-                        self.send_packet(expected_seq - 1, TYPE_ACK) # Команды подтверждаем всегда
+                        self.send_packet(expected_seq - 1, TYPE_ACK)
                         if payload.endswith(b'\n'):
                              return b''.join(received_chunks[i] for i in sorted(received_chunks.keys()))
                     elif seq < expected_seq:
@@ -126,7 +126,6 @@ class RUDPConnection:
             except OSError: pass
 
     def send_file_bulk(self, filename):
-        """Скоростная отправка файла"""
         self.flush()
         base = 0
         next_seq = 0
@@ -134,7 +133,6 @@ class RUDPConnection:
         f = open(filename, 'rb')
         retries = 0
         
-        # Предварительное чтение для скорости
         try:
             while True:
                 # 1. Заполняем окно "до отказа"
