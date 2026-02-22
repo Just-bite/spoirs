@@ -7,7 +7,7 @@ import time
 PACKET_SIZE = 65536
 HEADER_FMT = '!IB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-WINDOW_SIZE = 64        # Размер окна (количество пакетов без подтверждения)
+WINDOW_SIZE = 128        # Размер окна (количество пакетов без подтверждения)
 ACK_FREQUENCY = 16       # Шлать ACK только на каждый 8-й пакет (Cumulative ACK)
 MAX_RETRIES = 50        # Лимит попыток
 
