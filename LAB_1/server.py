@@ -145,12 +145,24 @@ def process_client(conn, addr):
 def start_server():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     setup_keepalive(s)
-    s.bind((HOST, PORT))
+    print("Enter port for server (default 9090): ")
+    potential_port = input().strip()
+    port = PORT
+    if  not potential_port:
+        s.bind((HOST, PORT))
+    else:
+        try:
+            port = int(potential_port)
+            if not (0 <= port <= 65535):
+                raise ValueError("Port out of range")
+        except ValueError:
+            print("Invalid input! Using default port.")
+        s.bind((HOST, port))
     s.listen(1)
     s.settimeout(0.5) 
     
     local_ip = get_local_ip()
-    print(f"Server is listening on 0.0.0.0:{PORT}")
+    print(f"Server is listening on 0.0.0.0:{port}")
     print(f"Your Local IP for client to connect: {local_ip}")
     
     while True:
