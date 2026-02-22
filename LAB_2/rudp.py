@@ -4,7 +4,7 @@ import select
 import time
 
 # --- НАСТРОЙКИ ПРОИЗВОДИТЕЛЬНОСТИ ---
-PACKET_SIZE = 32768     # 32 KB - Золотая середина для Python UDP
+PACKET_SIZE = 65536
 HEADER_FMT = '!IB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 WINDOW_SIZE = 64        # Размер окна (количество пакетов без подтверждения)
