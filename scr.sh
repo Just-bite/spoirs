@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -x
-
 git pull
 
 rm -f f.zip
