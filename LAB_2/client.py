@@ -4,19 +4,16 @@ import time
 import os
 from rudp import RUDPConnection, TYPE_SYN, TYPE_FIN
 
-HOST = '127.0.0.1'
-PORT = 9090
-
-def connect_udp():
+def connect_udp(host, port):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setblocking(0)
     try: s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
     except: pass
     
-    conn = RUDPConnection(s, (HOST, PORT))
-    print(f"Connecting to {HOST}:{PORT}...")
+    conn = RUDPConnection(s, (host, port))
+    print(f"Connecting to {host}:{port}...")
     
-    for _ in range(5):
+    for _ in range(3):
         conn.send_packet(0, TYPE_SYN)
         if conn._wait_ack(0) != -1:
             print("Connected!")
@@ -29,7 +26,6 @@ def do_download(conn, filename):
     print(f"Requesting {filename}...")
     conn.send_reliable_data(f"DOWNLOAD {filename}\n".encode())
     
-    # Ждем ответ сервера 5 секунд
     resp = conn.recv_reliable_data(timeout=5.0)
     if not resp:
         print("No response from server.")
@@ -37,23 +33,20 @@ def do_download(conn, filename):
         
     msg = resp.decode().strip()
     if not msg.startswith('OK'):
-        print(f"Server: {msg}")
+        print(f"Server response: {msg}")
         return
         
     try:
         filesize = int(msg.split()[1])
     except:
-        print("Invalid server response.")
+        print("Invalid size format.")
         return
 
-    print(f"File size: {filesize} bytes.")
+    print(f"Size: {filesize} bytes. Downloading...")
     
-    # --- СИНХРОНИЗАЦИЯ ---
-    # Шлем READY и даем серверу чуть времени на обработку
     conn.send_reliable_data(b"READY\n")
     time.sleep(0.1) 
     
-    print("Downloading...")
     start = time.time()
     conn.recv_stream_to_file(filename, filesize)
     duration = time.time() - start
@@ -61,41 +54,70 @@ def do_download(conn, filename):
     if os.path.exists(filename):
         actual = os.path.getsize(filename)
         mbps = (actual * 8) / (duration * 1024 * 1024) if duration > 0 else 0
-        print(f"Done! {actual}/{filesize} bytes. Speed: {mbps:.2f} Mbps")
+        print(f"Done. {actual}/{filesize} bytes. Speed: {mbps:.2f} Mbps")
     else:
-        print("Error: File not created.")
+        print("Download failed.")
 
-def main():
-    conn = connect_udp()
-    if not conn: return
+def main_loop(host, port):
+    conn = connect_udp(host, port)
+    if not conn:
+        print("Could not connect.")
+        return False
 
-    while True:
-        try:
+    try:
+        while True:
             cmd = input("UDP> ").strip()
             if not cmd: continue
             
             if cmd.lower() in ('exit', 'quit'):
-                conn.send_packet(0, TYPE_FIN)
                 break
                 
             if cmd.lower().startswith('download'):
                 parts = cmd.split()
                 if len(parts) > 1: do_download(conn, parts[1])
-                else: print("Usage: download <file>")
+                else: print("Usage: download <filename>")
             else:
                 conn.send_reliable_data((cmd + "\n").encode())
-                # Ждем ответ на команду 2 секунды
                 resp = conn.recv_reliable_data(timeout=2.0)
                 if resp: print(resp.decode().strip())
-                else: print("Timeout/No response.")
+                else: print("No response.")
                 
-        except KeyboardInterrupt: break
-        except Exception as e:
-            print(f"Error: {e}")
-            break
+    except (ConnectionResetError, socket.timeout):
+        print("\nConnection lost.")
+        return False 
+    except KeyboardInterrupt:
+        return True # Exit requested
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+    finally:
+        # Всегда пытаемся попрощаться с сервером
+        try: 
+            conn.send_packet(0, TYPE_FIN)
+            time.sleep(0.05)
+            conn.sock.close()
+        except: pass
+
+    return True # Normal exit
+
+def start_client():
+    default_ip = "127.0.0.1"
+    default_port = 9090
     
-    try: conn.sock.close()
-    except: pass
+    host_in = input(f"Enter Server IP (default {default_ip}): ").strip()
+    HOST = host_in if host_in else default_ip
+    
+    port_in = input(f"Enter Port (default {default_port}): ").strip()
+    PORT = int(port_in) if port_in else default_port
+
+    while True:
+        exit_requested = main_loop(HOST, PORT)
+        if exit_requested is True: # Пользователь вышел сам
+            sys.exit(0)
+            
+        ans = input("Retry connection? (y/n): ").strip().lower()
+        if ans != 'y':
+            sys.exit(0)
 
 if __name__ == '__main__':
-    main()
+    start_client()

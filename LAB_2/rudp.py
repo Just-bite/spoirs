@@ -3,13 +3,12 @@ import struct
 import select
 import time
 
-# --- НАСТРОЙКИ ---
-PACKET_SIZE = 4096   # 4KB - Оптимально для UDP на Windows
-HEADER_FMT = '!IB'   # Seq (4 bytes), Type (1 byte)
+PACKET_SIZE = 4096
+HEADER_FMT = '!IB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-WINDOW_SIZE = 16     # Размер окна
-ACK_TIMEOUT = 0.3    # Время ожидания подтверждения (ACK)
-MAX_RETRIES = 20     # Количество попыток отправки пакета
+WINDOW_SIZE = 16
+ACK_TIMEOUT = 0.3
+MAX_RETRIES = 20
 
 TYPE_DATA = 0
 TYPE_ACK = 1
@@ -23,7 +22,6 @@ class RUDPConnection:
         self.sock.setblocking(0)
         
     def flush(self):
-        """Очистка входящего буфера от старых пакетов"""
         try:
             while True:
                 data, _ = self.sock.recvfrom(65536)
@@ -54,8 +52,7 @@ class RUDPConnection:
         return -1
 
     def send_reliable_data(self, data_source):
-        """Отправка короткого сообщения (команды)"""
-        self.flush() 
+        self.flush()
         if isinstance(data_source, bytes):
             chunks = [data_source[i:i+PACKET_SIZE] for i in range(0, len(data_source), PACKET_SIZE)]
             if not chunks: chunks = [b'']
@@ -66,7 +63,6 @@ class RUDPConnection:
         retries = 0
 
         while base < len(chunks):
-            # Send Window
             while next_seq < base + WINDOW_SIZE and next_seq < len(chunks):
                 self.send_packet(next_seq, TYPE_DATA, chunks[next_seq])
                 next_seq += 1
@@ -76,33 +72,43 @@ class RUDPConnection:
             if ack >= base:
                 base = ack + 1
                 retries = 0
-            elif ack == -2: raise ConnectionResetError("Closed")
+            elif ack == -2: raise ConnectionResetError("Connection closed by peer")
             else:
                 retries += 1
-                if retries > MAX_RETRIES: raise ConnectionResetError("Timeout sending data")
-                next_seq = base # Go-Back-N resend
+                if retries > MAX_RETRIES: raise ConnectionResetError("Max retries exceeded")
+                next_seq = base
 
     def recv_reliable_data(self, timeout=None):
-        """
-        Прием сообщения. 
-        timeout=None -> ждать вечно (для сервера).
-        timeout=N -> ждать N секунд (для клиента).
-        """
         expected_seq = 0
         received_chunks = {}
         start_wait = time.time()
         
         while True:
-            # Проверка общего таймаута (если задан)
             if timeout is not None and (time.time() - start_wait > timeout):
                 return None
 
             try:
-                # Ждем данные 0.1 сек
                 ready = select.select([self.sock], [], [], 0.1)
                 if not ready[0]: continue
                 
                 data, addr = self.sock.recvfrom(65536)
+                
+                # --- ЛОГИКА ПЕРЕХВАТА СЕССИИ ---
+                if len(data) >= HEADER_SIZE:
+                    seq, type_val = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
+                    
+                    # Если пришел SYN (новый клиент или реконнект старого)
+                    if type_val == TYPE_SYN:
+                        # Переключаемся на этого клиента
+                        self.addr = addr
+                        self.send_packet(0, TYPE_ACK)
+                        # Сбрасываем состояние приема
+                        expected_seq = 0
+                        received_chunks = {}
+                        start_wait = time.time()
+                        continue
+                # -------------------------------
+
                 if self.addr is None: self.addr = addr
                 if addr != self.addr: continue
                 
@@ -110,12 +116,10 @@ class RUDPConnection:
                 seq, type_val = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
                 payload = data[HEADER_SIZE:]
                 
-                if type_val == TYPE_SYN: # Если клиент делает повторный SYN
-                    self.send_packet(0, TYPE_ACK)
-                    continue
+                if type_val == TYPE_FIN:
+                    return b'' # Сигнал о закрытии
 
                 if type_val == TYPE_DATA:
-                    # Если сообщение пришло, сбрасываем таймер таймаута
                     if timeout is not None: start_wait = time.time()
                     
                     if seq == expected_seq:
@@ -123,17 +127,14 @@ class RUDPConnection:
                         expected_seq += 1
                         self.send_packet(expected_seq - 1, TYPE_ACK)
                         
-                        # Если нашли конец строки - возвращаем собранное
                         if payload.endswith(b'\n'):
                              return b''.join(received_chunks[i] for i in sorted(received_chunks.keys()))
                     elif seq < expected_seq:
-                        self.send_packet(expected_seq - 1, TYPE_ACK) # Повторный ACK
+                        self.send_packet(expected_seq - 1, TYPE_ACK)
             except (BlockingIOError, OSError): pass
 
     def send_file_bulk(self, filename):
-        """Отправка файла"""
         self.flush()
-        import os
         base = 0
         next_seq = 0
         file_buffer = {}
@@ -142,7 +143,6 @@ class RUDPConnection:
         
         try:
             while True:
-                # Заполняем окно
                 while next_seq < base + WINDOW_SIZE:
                     if next_seq not in file_buffer:
                         chunk = f.read(PACKET_SIZE)
@@ -155,7 +155,6 @@ class RUDPConnection:
                     self.send_packet(next_seq, TYPE_DATA, file_buffer[next_seq])
                     next_seq += 1
                 
-                # Выход: все отправлено и подтверждено
                 if base == next_seq and (base in file_buffer and file_buffer[base] is None):
                     break
                 if base == next_seq and not file_buffer: 
@@ -171,8 +170,7 @@ class RUDPConnection:
                 else:
                     retries += 1
                     if retries > MAX_RETRIES:
-                        print(f"Error: Max retries exceeded at seq {base}")
-                        break
+                        raise ConnectionResetError("File transfer timed out")
                     next_seq = base
         finally:
             f.close()
@@ -181,7 +179,6 @@ class RUDPConnection:
                 time.sleep(0.01)
 
     def recv_stream_to_file(self, filename, expected_size):
-        """Прием файла"""
         self.flush()
         expected_seq = 0
         bytes_written = 0
@@ -190,14 +187,16 @@ class RUDPConnection:
         f = open(filename, 'wb')
         try:
             while bytes_written < expected_size:
-                # Анти-зависание: если тишина 2 сек, пинаем сервер ACK-ом
                 if time.time() - last_activity > 2.0:
                     self.send_packet(max(0, expected_seq - 1), TYPE_ACK)
                     last_activity = time.time()
 
                 try:
                     ready = select.select([self.sock], [], [], 1.0)
-                    if not ready[0]: continue 
+                    if not ready[0]: 
+                        if time.time() - last_activity > 10.0:
+                            raise ConnectionResetError("Receive timeout")
+                        continue 
                     
                     packet, addr = self.sock.recvfrom(65536)
                     if addr != self.addr: continue

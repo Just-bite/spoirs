@@ -1,12 +1,19 @@
 import socket
 import os
-import sys
 import struct
 import select
 from rudp import RUDPConnection, TYPE_SYN, TYPE_ACK
 
-HOST = '0.0.0.0'
-PORT = 9090
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
 
 def handle_request(rudp, data):
     try:
@@ -16,7 +23,6 @@ def handle_request(rudp, data):
     if not msg: return True
     parts = msg.split()
     cmd = parts[0].upper()
-    print(f"Command: {cmd}")
     
     if cmd == 'ECHO':
         rudp.send_reliable_data((" ".join(parts[1:]) + "\n").encode())
@@ -34,20 +40,12 @@ def handle_request(rudp, data):
             return True
             
         size = os.path.getsize(filename)
-        # 1. Отправляем размер
         rudp.send_reliable_data(f"OK {size}\n".encode())
         
-        # 2. Ждем готовности (синхронизация)
-        print("Waiting for client READY...")
-        confirm = rudp.recv_reliable_data(timeout=10.0) # Ждем READY 10 сек
-        
+        confirm = rudp.recv_reliable_data(timeout=10.0)
         if confirm and b'READY' in confirm:
-            print(f"Sending {filename} ({size} bytes)...")
             rudp.send_file_bulk(filename)
-            print("Transfer finished.")
-        else:
-            print("Client handshake timeout.")
-
+        
     elif cmd == 'UPLOAD':
         rudp.send_reliable_data(b"ERROR Not implemented\n")
         
@@ -59,15 +57,28 @@ def handle_request(rudp, data):
     return True
 
 def start_server():
+    default_ip = "0.0.0.0"
+    default_port = 9090
+    
+    print(f"Detected Local IP: {get_local_ip()}")
+    
+    port_input = input(f"Enter Port (default {default_port}): ").strip()
+    PORT = int(port_input) if port_input else default_port
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((HOST, PORT))
+    try:
+        sock.bind((default_ip, PORT))
+    except Exception as e:
+        print(f"Error binding to port: {e}")
+        return
+
     sock.setblocking(0)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
     except: pass
     
-    print(f"UDP Server on {PORT}")
+    print(f"UDP Server listening on {default_ip}:{PORT}")
     
     while True:
         try:
@@ -78,23 +89,45 @@ def start_server():
                     if len(data) >= 5:
                         _, type_val = struct.unpack('!IB', data[:5])
                         if type_val == TYPE_SYN:
-                            print(f"New client: {addr}")
+                            print(f"Client connected: {addr}")
                             rudp = RUDPConnection(sock, addr)
                             rudp.send_packet(0, TYPE_ACK)
                             
                             while True:
-                                # Ждем команду 300 секунд (5 минут)
-                                req = rudp.recv_reliable_data(timeout=300.0)
-                                
-                                if req is None: 
-                                    print("Client idle timeout (300s).")
-                                    break 
-                                if not handle_request(rudp, req): 
+                                try:
+                                    # Ждем команду 300 сек
+                                    # Если придет SYN от другого, recv_reliable_data переключится сам
+                                    req = rudp.recv_reliable_data(timeout=300.0)
+                                    
+                                    # Проверка: не переключился ли клиент "на лету"?
+                                    if rudp.addr != addr:
+                                        print(f"Session hijacked by new client: {rudp.addr}")
+                                        addr = rudp.addr
+                                        # Продолжаем цикл с новым адресом
+                                        if req is None: continue 
+                                        
+                                    if req is None: 
+                                        print("Client idle timeout.")
+                                        break 
+                                    if req == b'':
+                                        print("Client sent FIN.")
+                                        break
+                                        
+                                    if not handle_request(rudp, req): 
+                                        break
+                                except ConnectionResetError:
                                     break
-                            print("Session ended.")
+                                except Exception:
+                                    break
+                                    
+                            print(f"Client disconnected. Waiting for new...")
                 except OSError: pass
-        except KeyboardInterrupt: break
-        except Exception as e: print(f"Server Error: {e}")
+        except KeyboardInterrupt:
+            print("\nServer shutting down.")
+            break
+        except Exception as e:
+            print(f"Server Error: {e}")
+            
     sock.close()
 
 if __name__ == '__main__':
