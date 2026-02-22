@@ -3,13 +3,12 @@ import struct
 import select
 import time
 
-# --- НАСТРОЙКИ ПРОИЗВОДИТЕЛЬНОСТИ ---
-PACKET_SIZE = 65536
+PACKET_SIZE = 32768
 HEADER_FMT = '!IB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-WINDOW_SIZE = 128        # Размер окна (количество пакетов без подтверждения)
-ACK_FREQUENCY = 16       # Шлать ACK только на каждый 8-й пакет (Cumulative ACK)
-MAX_RETRIES = 50        # Лимит попыток
+WINDOW_SIZE = 64     
+ACK_FREQUENCY = 16       
+MAX_RETRIES = 50        
 
 TYPE_DATA = 0
 TYPE_ACK = 1
@@ -37,7 +36,6 @@ class RUDPConnection:
             pass
 
     def _wait_ack_nonblocking(self):
-        """Проверяет, есть ли ACK во входящем буфере. Не блокирует."""
         try:
             data, addr = self.sock.recvfrom(65536)
             if self.addr and addr != self.addr: return -1
@@ -50,10 +48,9 @@ class RUDPConnection:
         return -1
 
     def send_reliable_data(self, data_source):
-        """Отправка команд (старый надежный метод, по 1 пакету)"""
         self.flush()
         if isinstance(data_source, bytes):
-            chunks = [data_source[i:i+4096] for i in range(0, len(data_source), 4096)] # Для команд оставим 4к
+            chunks = [data_source[i:i+4096] for i in range(0, len(data_source), 4096)]
             if not chunks: chunks = [b'']
         else: raise ValueError("Only bytes allowed")
 
@@ -62,7 +59,7 @@ class RUDPConnection:
         retries = 0
 
         while base < len(chunks):
-            while next_seq < base + 16 and next_seq < len(chunks): # Окно для команд меньше
+            while next_seq < base + 16 and next_seq < len(chunks):
                 self.send_packet(next_seq, TYPE_DATA, chunks[next_seq])
                 next_seq += 1
             
