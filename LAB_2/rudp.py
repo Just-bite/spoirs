@@ -8,7 +8,7 @@ PACKET_SIZE = 32768     # 32 KB - Золотая середина для Python 
 HEADER_FMT = '!IB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 WINDOW_SIZE = 64        # Размер окна (количество пакетов без подтверждения)
-ACK_FREQUENCY = 8       # Шлать ACK только на каждый 8-й пакет (Cumulative ACK)
+ACK_FREQUENCY = 16       # Шлать ACK только на каждый 8-й пакет (Cumulative ACK)
 MAX_RETRIES = 50        # Лимит попыток
 
 TYPE_DATA = 0
