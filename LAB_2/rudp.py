@@ -3,12 +3,13 @@ import struct
 import select
 import time
 
-PACKET_SIZE = 4096
+# --- НАСТРОЙКИ ПРОИЗВОДИТЕЛЬНОСТИ ---
+PACKET_SIZE = 32768     # 32 KB - Золотая середина для Python UDP
 HEADER_FMT = '!IB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-WINDOW_SIZE = 16
-ACK_TIMEOUT = 0.3
-MAX_RETRIES = 20
+WINDOW_SIZE = 64        # Размер окна (количество пакетов без подтверждения)
+ACK_FREQUENCY = 8       # Шлать ACK только на каждый 8-й пакет (Cumulative ACK)
+MAX_RETRIES = 50        # Лимит попыток
 
 TYPE_DATA = 0
 TYPE_ACK = 1
@@ -35,26 +36,24 @@ class RUDPConnection:
         except (BlockingIOError, OSError):
             pass
 
-    def _wait_ack(self, expected_ack_seq):
-        start = time.time()
-        while time.time() - start < ACK_TIMEOUT:
-            try:
-                ready = select.select([self.sock], [], [], 0.01)
-                if ready[0]:
-                    data, addr = self.sock.recvfrom(65536)
-                    if self.addr and addr != self.addr: continue
-                    if len(data) < HEADER_SIZE: continue
-                    
-                    seq, type_val = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-                    if type_val == TYPE_ACK: return seq
-                    if type_val == TYPE_FIN: return -2 
-            except (BlockingIOError, OSError): pass
+    def _wait_ack_nonblocking(self):
+        """Проверяет, есть ли ACK во входящем буфере. Не блокирует."""
+        try:
+            data, addr = self.sock.recvfrom(65536)
+            if self.addr and addr != self.addr: return -1
+            if len(data) < HEADER_SIZE: return -1
+            seq, type_val = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
+            if type_val == TYPE_ACK: return seq
+            if type_val == TYPE_FIN: return -2
+        except (BlockingIOError, OSError):
+            pass
         return -1
 
     def send_reliable_data(self, data_source):
+        """Отправка команд (старый надежный метод, по 1 пакету)"""
         self.flush()
         if isinstance(data_source, bytes):
-            chunks = [data_source[i:i+PACKET_SIZE] for i in range(0, len(data_source), PACKET_SIZE)]
+            chunks = [data_source[i:i+4096] for i in range(0, len(data_source), 4096)] # Для команд оставим 4к
             if not chunks: chunks = [b'']
         else: raise ValueError("Only bytes allowed")
 
@@ -63,22 +62,30 @@ class RUDPConnection:
         retries = 0
 
         while base < len(chunks):
-            while next_seq < base + WINDOW_SIZE and next_seq < len(chunks):
+            while next_seq < base + 16 and next_seq < len(chunks): # Окно для команд меньше
                 self.send_packet(next_seq, TYPE_DATA, chunks[next_seq])
                 next_seq += 1
             
-            ack = self._wait_ack(base)
+            # Ждем ACK с таймаутом
+            start = time.time()
+            ack_received = -1
+            while time.time() - start < 0.5:
+                ready = select.select([self.sock], [], [], 0.05)
+                if ready[0]:
+                    ack_received = self._wait_ack_nonblocking()
+                    if ack_received >= base or ack_received == -2: break
             
-            if ack >= base:
-                base = ack + 1
+            if ack_received >= base:
+                base = ack_received + 1
                 retries = 0
-            elif ack == -2: raise ConnectionResetError("Connection closed by peer")
+            elif ack_received == -2: raise ConnectionResetError("Closed")
             else:
                 retries += 1
-                if retries > MAX_RETRIES: raise ConnectionResetError("Max retries exceeded")
+                if retries > 20: raise ConnectionResetError("Timeout sending command")
                 next_seq = base
 
     def recv_reliable_data(self, timeout=None):
+        """Прием команд"""
         expected_seq = 0
         received_chunks = {}
         start_wait = time.time()
@@ -87,53 +94,42 @@ class RUDPConnection:
             if timeout is not None and (time.time() - start_wait > timeout):
                 return None
 
+            ready = select.select([self.sock], [], [], 0.1)
+            if not ready[0]: continue
+            
             try:
-                ready = select.select([self.sock], [], [], 0.1)
-                if not ready[0]: continue
-                
                 data, addr = self.sock.recvfrom(65536)
                 
-                # --- ЛОГИКА ПЕРЕХВАТА СЕССИИ ---
                 if len(data) >= HEADER_SIZE:
                     seq, type_val = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-                    
-                    # Если пришел SYN (новый клиент или реконнект старого)
                     if type_val == TYPE_SYN:
-                        # Переключаемся на этого клиента
                         self.addr = addr
                         self.send_packet(0, TYPE_ACK)
-                        # Сбрасываем состояние приема
-                        expected_seq = 0
-                        received_chunks = {}
-                        start_wait = time.time()
-                        continue
-                # -------------------------------
+                        return None # Сброс
 
                 if self.addr is None: self.addr = addr
                 if addr != self.addr: continue
-                
                 if len(data) < HEADER_SIZE: continue
+                
                 seq, type_val = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
                 payload = data[HEADER_SIZE:]
                 
-                if type_val == TYPE_FIN:
-                    return b'' # Сигнал о закрытии
+                if type_val == TYPE_FIN: return b''
 
                 if type_val == TYPE_DATA:
                     if timeout is not None: start_wait = time.time()
-                    
                     if seq == expected_seq:
                         received_chunks[seq] = payload
                         expected_seq += 1
-                        self.send_packet(expected_seq - 1, TYPE_ACK)
-                        
+                        self.send_packet(expected_seq - 1, TYPE_ACK) # Команды подтверждаем всегда
                         if payload.endswith(b'\n'):
                              return b''.join(received_chunks[i] for i in sorted(received_chunks.keys()))
                     elif seq < expected_seq:
                         self.send_packet(expected_seq - 1, TYPE_ACK)
-            except (BlockingIOError, OSError): pass
+            except OSError: pass
 
     def send_file_bulk(self, filename):
+        """Скоростная отправка файла"""
         self.flush()
         base = 0
         next_seq = 0
@@ -141,8 +137,10 @@ class RUDPConnection:
         f = open(filename, 'rb')
         retries = 0
         
+        # Предварительное чтение для скорости
         try:
             while True:
+                # 1. Заполняем окно "до отказа"
                 while next_seq < base + WINDOW_SIZE:
                     if next_seq not in file_buffer:
                         chunk = f.read(PACKET_SIZE)
@@ -155,67 +153,131 @@ class RUDPConnection:
                     self.send_packet(next_seq, TYPE_DATA, file_buffer[next_seq])
                     next_seq += 1
                 
+                # Условие выхода
                 if base == next_seq and (base in file_buffer and file_buffer[base] is None):
                     break
                 if base == next_seq and not file_buffer: 
                     break
 
-                ack = self._wait_ack(base)
+                # 2. Неблокирующая проверка ACK
+                # Мы не ждем ACK, мы проверяем, есть ли он. 
+                # Если окно полно и ACK нет -> тогда ждем.
                 
+                ack = -1
+                # Если окно заполнено, мы обязаны ждать ACK, иначе крутимся впустую
+                if next_seq >= base + WINDOW_SIZE:
+                    ready = select.select([self.sock], [], [], 0.5) # Ждем
+                    if ready[0]:
+                        ack = self._wait_ack_nonblocking()
+                else:
+                    # Если окно не полно, проверяем быстро без ожидания
+                    ack = self._wait_ack_nonblocking()
+
                 if ack >= base:
-                    for i in range(base, ack + 1):
-                        if i in file_buffer: del file_buffer[i]
+                    # Cumulative ACK: удаляем все до ack включительно
+                    # Удаление из словаря может быть медленным, но на таких скоростях приемлемо
+                    # Оптимизация: удаляем диапазоном
+                    keys_to_del = [k for k in file_buffer.keys() if k <= ack]
+                    for k in keys_to_del: del file_buffer[k]
+                    
                     base = ack + 1
                     retries = 0
                 else:
-                    retries += 1
-                    if retries > MAX_RETRIES:
-                        raise ConnectionResetError("File transfer timed out")
-                    next_seq = base
+                    # ACK не пришел (или старый)
+                    # Если окно заполнено и таймаут прошел - это потеря
+                    if next_seq >= base + WINDOW_SIZE and ack == -1:
+                        retries += 1
+                        if retries > MAX_RETRIES:
+                            print(f"\n[!] Transfer timed out. Base: {base}")
+                            break
+                        # Go-Back-N (Упрощенно: сбрасываем next_seq, чтобы цикл while перепослал)
+                        # В реальной жизни лучше Fast Retransmit, но тут пересылаем всё окно
+                        next_seq = base
         finally:
             f.close()
+            # Посылаем FIN
             for _ in range(5): 
                 self.send_packet(next_seq, TYPE_FIN)
-                time.sleep(0.01)
+                time.sleep(0.005)
 
-    def recv_stream_to_file(self, filename, expected_size):
+    def recv_stream_to_file(self, filename, expected_size, progress_callback=None):
         self.flush()
         expected_seq = 0
         bytes_written = 0
         last_activity = time.time()
+        last_ack_time = time.time()
         
+        # Буфер записи: пишем на диск не по 32КБ, а по 1МБ для скорости
+        write_buffer = []
+        write_buffer_size = 0
+        MAX_WRITE_BUFFER = 1024 * 1024 
+
         f = open(filename, 'wb')
         try:
             while bytes_written < expected_size:
-                if time.time() - last_activity > 2.0:
-                    self.send_packet(max(0, expected_seq - 1), TYPE_ACK)
-                    last_activity = time.time()
-
+                # Ожидание данных
+                ready = select.select([self.sock], [], [], 1.0)
+                if not ready[0]: 
+                    if time.time() - last_activity > 10.0:
+                        self.send_packet(expected_seq - 1, TYPE_ACK) # Пингуем сервер
+                    if time.time() - last_activity > 30.0:
+                        raise ConnectionResetError("Receive timeout")
+                    continue 
+                
                 try:
-                    ready = select.select([self.sock], [], [], 1.0)
-                    if not ready[0]: 
-                        if time.time() - last_activity > 10.0:
-                            raise ConnectionResetError("Receive timeout")
-                        continue 
-                    
-                    packet, addr = self.sock.recvfrom(65536)
+                    data, addr = self.sock.recvfrom(65536)
                     if addr != self.addr: continue
-                    if len(packet) < HEADER_SIZE: continue
                     
-                    seq, type_val = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
-                    payload = packet[HEADER_SIZE:]
+                    if len(data) < HEADER_SIZE: continue
+                    seq, type_val = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
+                    payload = data[HEADER_SIZE:]
                     
                     if type_val == TYPE_FIN: break
                     
                     if type_val == TYPE_DATA:
                         last_activity = time.time()
+                        
                         if seq == expected_seq:
-                            f.write(payload)
-                            bytes_written += len(payload)
+                            # Добавляем в буфер записи
+                            write_buffer.append(payload)
+                            write_buffer_size += len(payload)
                             expected_seq += 1
-                            self.send_packet(expected_seq - 1, TYPE_ACK)
+                            
+                            # Сбрасываем буфер на диск если он большой
+                            if write_buffer_size >= MAX_WRITE_BUFFER:
+                                f.write(b''.join(write_buffer))
+                                bytes_written += write_buffer_size
+                                write_buffer = []
+                                write_buffer_size = 0
+                                if progress_callback: progress_callback(bytes_written, expected_size)
+
+                            # LOGIC: Cumulative ACK
+                            # Шлем ACK если:
+                            # 1. Прошло N пакетов (ACK_FREQUENCY)
+                            # 2. ИЛИ Прошло много времени (>0.02с)
+                            # 3. ИЛИ Это последний кусок
+                            if (expected_seq % ACK_FREQUENCY == 0) or \
+                               (time.time() - last_ack_time > 0.02) or \
+                               (bytes_written + write_buffer_size >= expected_size):
+                                
+                                self.send_packet(expected_seq - 1, TYPE_ACK)
+                                last_ack_time = time.time()
+                                
                         elif seq < expected_seq:
+                            # Если пришел повтор, значит наш ACK потерялся. 
+                            # Срочно подтверждаем текущее состояние.
                             self.send_packet(expected_seq - 1, TYPE_ACK)
-                except (BlockingIOError, OSError): pass
+                            
+                except OSError: pass
+            
+            # Дописываем остатки
+            if write_buffer:
+                f.write(b''.join(write_buffer))
+                bytes_written += write_buffer_size
+                if progress_callback: progress_callback(bytes_written, expected_size)
+
+            # Финальные подтверждения
+            for _ in range(3): self.send_packet(expected_seq - 1, TYPE_ACK)
+
         finally:
             f.close()
