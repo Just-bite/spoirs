@@ -95,15 +95,11 @@ def start_server():
                             
                             while True:
                                 try:
-                                    # Ждем команду 300 сек
-                                    # Если придет SYN от другого, recv_reliable_data переключится сам
                                     req = rudp.recv_reliable_data(timeout=300.0)
                                     
-                                    # Проверка: не переключился ли клиент "на лету"?
                                     if rudp.addr != addr:
                                         print(f"Session hijacked by new client: {rudp.addr}")
                                         addr = rudp.addr
-                                        # Продолжаем цикл с новым адресом
                                         if req is None: continue 
                                         
                                     if req is None: 
