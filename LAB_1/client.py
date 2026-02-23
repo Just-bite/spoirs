@@ -119,7 +119,7 @@ def print_progress(current, total, last_printed_percent):
         if percent - last_printed_percent >= 0.1 or current == total:
             mb_curr = current / (1024 * 1024)
             mb_total = total / (1024 * 1024)
-            sys.stdout.write(f"\rDownloading: {percent:.1f}%  ({mb_curr:.0f}/{mb_total:.0f} MB)   ")
+            sys.stdout.write(f"\rProgress: {percent:.1f}%  ({mb_curr:.0f}/{mb_total:.0f} MB)   ")
             sys.stdout.flush()
             return percent
     return last_printed_percent
